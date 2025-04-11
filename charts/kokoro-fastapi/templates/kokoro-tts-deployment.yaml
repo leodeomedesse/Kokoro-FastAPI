@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kokoro-fastapi.fullname" . }}-kokoro-tts
+  labels:
+    {{- include "kokoro-fastapi.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.kokoroTTS.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "kokoro-fastapi.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "kokoro-fastapi.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.kokoroTTS.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kokoro-fastapi.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers: []
+      containers:
+        - name: kokoro-tts
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.kokoroTTS.repository }}:{{ .Values.kokoroTTS.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.kokoroTTS.pullPolicy }}
+          env:
+            - name: PYTHONPATH
+              value: "/app:/app/api"
+            - name: USE_GPU
+              value: "true"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          ports:
+            - name: kokoro-tts-http
+              containerPort: {{ .Values.kokoroTTS.port | default 8880 }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: kokoro-tts-http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: kokoro-tts-http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.kokoroTTS.resources | nindent 12 }}
+          volumeMounts: []
+      volumes: []
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

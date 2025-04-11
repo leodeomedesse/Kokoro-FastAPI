@@ -9,10 +9,10 @@ RUN apt-get update && apt-get install -y \
     curl \
     ffmpeg \
     g++ \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /usr/share/espeak-ng-data \
-    && ln -s /usr/lib/*/espeak-ng-data/* /usr/share/espeak-ng-data/
+&& apt-get clean \
+&& rm -rf /var/lib/apt/lists/* \
+&& mkdir -p /usr/share/espeak-ng-data \
+&& ln -s /usr/lib/*/espeak-ng-data/* /usr/share/espeak-ng-data/
 
 # Install UV using the installer script
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
@@ -32,7 +32,7 @@ COPY --chown=appuser:appuser pyproject.toml ./pyproject.toml
 
 # Install dependencies
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv && \
+    uv venv --python 3.10 && \
     uv sync --extra cpu
 
 # Copy project files including models

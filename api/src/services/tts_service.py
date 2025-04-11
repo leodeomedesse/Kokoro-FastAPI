@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import tempfile
 import time
 from typing import AsyncGenerator, List, Optional, Tuple, Union
@@ -12,10 +13,13 @@ from kokoro import KPipeline
 from loguru import logger
 
 from ..core.config import settings
+from ..inference.base import AudioChunk
 from ..inference.kokoro_v1 import KokoroV1
 from ..inference.model_manager import get_manager as get_model_manager
 from ..inference.voice_manager import get_manager as get_voice_manager
+from ..structures.schemas import NormalizationOptions
 from .audio import AudioNormalizer, AudioService
+from .streaming_audio_writer import StreamingAudioWriter
 from .text_processing import tokenize
 from .text_processing.text_processor import process_text_chunk, smart_split
 
@@ -47,12 +51,14 @@ class TTSService:
         voice_name: str,
         voice_path: str,
         speed: float,
+        writer: StreamingAudioWriter,
         output_format: Optional[str] = None,
         is_first: bool = False,
         is_last: bool = False,
         normalizer: Optional[AudioNormalizer] = None,
         lang_code: Optional[str] = None,
-    ) -> AsyncGenerator[Union[np.ndarray, bytes], None]:
+        return_timestamps: Optional[bool] = False,
+    ) -> AsyncGenerator[AudioChunk, None]:
         """Process tokens into audio."""
         async with self._chunk_semaphore:
             try:
@@ -60,18 +66,20 @@ class TTSService:
                 if is_last:
                     # Skip format conversion for raw audio mode
                     if not output_format:
-                        yield np.array([], dtype=np.float32)
+                        yield AudioChunk(np.array([], dtype=np.int16), output=b"")
                         return
-
-                    result = await AudioService.convert_audio(
-                        np.array([0], dtype=np.float32),  # Dummy data for type checking
-                        24000,
+                    chunk_data = await AudioService.convert_audio(
+                        AudioChunk(
+                            np.array([], dtype=np.float32)
+                        ),  # Dummy data for type checking
                         output_format,
-                        is_first_chunk=False,
+                        writer,
+                        speed,
+                        "",
                         normalizer=normalizer,
                         is_last_chunk=True,
                     )
-                    yield result
+                    yield chunk_data
                     return
 
                 # Skip empty chunks
@@ -83,66 +91,88 @@ class TTSService:
 
                 # Generate audio using pre-warmed model
                 if isinstance(backend, KokoroV1):
+                    chunk_index = 0
                     # For Kokoro V1, pass text and voice info with lang_code
-                    async for chunk_audio in self.model_manager.generate(
+                    async for chunk_data in self.model_manager.generate(
                         chunk_text,
                         (voice_name, voice_path),
                         speed=speed,
                         lang_code=lang_code,
+                        return_timestamps=return_timestamps,
                     ):
                         # For streaming, convert to bytes
                         if output_format:
                             try:
-                                converted = await AudioService.convert_audio(
-                                    chunk_audio,
-                                    24000,
+                                chunk_data = await AudioService.convert_audio(
+                                    chunk_data,
                                     output_format,
-                                    is_first_chunk=is_first,
-                                    normalizer=normalizer,
+                                    writer,
+                                    speed,
+                                    chunk_text,
                                     is_last_chunk=is_last,
+                                    normalizer=normalizer,
                                 )
-                                yield converted
+                                yield chunk_data
                             except Exception as e:
                                 logger.error(f"Failed to convert audio: {str(e)}")
                         else:
-                            yield chunk_audio
+                            chunk_data = AudioService.trim_audio(
+                                chunk_data, chunk_text, speed, is_last, normalizer
+                            )
+                            yield chunk_data
+                        chunk_index += 1
                 else:
                     # For legacy backends, load voice tensor
                     voice_tensor = await self._voice_manager.load_voice(
                         voice_name, device=backend.device
                     )
-                    chunk_audio = await self.model_manager.generate(
-                        tokens, voice_tensor, speed=speed
+                    chunk_data = await self.model_manager.generate(
+                        tokens,
+                        voice_tensor,
+                        speed=speed,
+                        return_timestamps=return_timestamps,
                     )
 
-                    if chunk_audio is None:
+                    if chunk_data.audio is None:
                         logger.error("Model generated None for audio chunk")
                         return
 
-                    if len(chunk_audio) == 0:
+                    if len(chunk_data.audio) == 0:
                         logger.error("Model generated empty audio chunk")
                         return
 
                     # For streaming, convert to bytes
                     if output_format:
                         try:
-                            converted = await AudioService.convert_audio(
-                                chunk_audio,
-                                24000,
+                            chunk_data = await AudioService.convert_audio(
+                                chunk_data,
                                 output_format,
-                                is_first_chunk=is_first,
+                                writer,
+                                speed,
+                                chunk_text,
                                 normalizer=normalizer,
                                 is_last_chunk=is_last,
                             )
-                            yield converted
+                            yield chunk_data
                         except Exception as e:
                             logger.error(f"Failed to convert audio: {str(e)}")
                     else:
-                        yield chunk_audio
+                        trimmed = AudioService.trim_audio(
+                            chunk_data, chunk_text, speed, is_last, normalizer
+                        )
+                        yield trimmed
             except Exception as e:
                 logger.error(f"Failed to process tokens: {str(e)}")
 
-    async def _get_voice_path(self, voice: str) -> Tuple[str, str]:
+    async def _load_voice_from_path(self, path: str, weight: float):
+        # Check if the path is None and raise a ValueError if it is not
+        if not path:
+            raise ValueError(f"Voice not found at path: {path}")
+
+        logger.debug(f"Loading voice tensor from path: {path}")
+        return torch.load(path, map_location="cpu") * weight
+
+    async def _get_voices_path(self, voice: str) -> Tuple[str, str]:
         """Get voice path, handling combined voices.
 
         Args:
@@ -155,62 +185,68 @@ class TTSService:
             RuntimeError: If voice not found
         """
         try:
-            # Check if it's a combined voice
-            if "+" in voice:
-                # Split on + but preserve any parentheses
-                voice_parts = []
-                weights = []
-                for part in voice.split("+"):
-                    part = part.strip()
-                    if not part:
-                        continue
-                    # Extract voice name and weight if present
-                    if "(" in part and ")" in part:
-                        voice_name = part.split("(")[0].strip()
-                        weight = float(part.split("(")[1].split(")")[0])
-                    else:
-                        voice_name = part
-                        weight = 1.0
-                    voice_parts.append(voice_name)
-                    weights.append(weight)
+            # Split the voice on + and - and ensure that they get added to the list eg: hi+bob = ["hi","+","bob"]
+            split_voice = re.split(r"([-+])", voice)
 
-                if len(voice_parts) < 2:
-                    raise RuntimeError(f"Invalid combined voice name: {voice}")
-
-                # Normalize weights to sum to 1
-                total_weight = sum(weights)
-                weights = [w / total_weight for w in weights]
-
-                # Load and combine voices
-                voice_tensors = []
-                for v, w in zip(voice_parts, weights):
-                    path = await self._voice_manager.get_voice_path(v)
+            # If it is only once voice there is no point in loading it up, doing nothing with it, then saving it
+            if len(split_voice) == 1:
+                # Since its a single voice the only time that the weight would matter is if voice_weight_normalization is off
+                if (
+                    "(" not in voice and ")" not in voice
+                ) or settings.voice_weight_normalization == True:
+                    path = await self._voice_manager.get_voice_path(voice)
                     if not path:
-                        raise RuntimeError(f"Voice not found: {v}")
-                    logger.debug(f"Loading voice tensor from: {path}")
-                    voice_tensor = torch.load(path, map_location="cpu")
-                    voice_tensors.append(voice_tensor * w)
+                        raise RuntimeError(f"Voice not found: {voice}")
+                    logger.debug(f"Using single voice path: {path}")
+                    return voice, path
 
-                # Sum the weighted voice tensors
-                logger.debug(
-                    f"Combining {len(voice_tensors)} voice tensors with weights {weights}"
+            total_weight = 0
+
+            for voice_index in range(0, len(split_voice), 2):
+                voice_object = split_voice[voice_index]
+
+                if "(" in voice_object and ")" in voice_object:
+                    voice_name = voice_object.split("(")[0].strip()
+                    voice_weight = float(voice_object.split("(")[1].split(")")[0])
+                else:
+                    voice_name = voice_object
+                    voice_weight = 1
+
+                total_weight += voice_weight
+                split_voice[voice_index] = (voice_name, voice_weight)
+
+            # If voice_weight_normalization is false prevent normalizing the weights by setting the total_weight to 1 so it divides each weight by 1
+            if settings.voice_weight_normalization == False:
+                total_weight = 1
+
+            # Load the first voice as the starting point for voices to be combined onto
+            path = await self._voice_manager.get_voice_path(split_voice[0][0])
+            combined_tensor = await self._load_voice_from_path(
+                path, split_voice[0][1] / total_weight
+            )
+
+            # Loop through each + or - in split_voice so they can be applied to combined voice
+            for operation_index in range(1, len(split_voice) - 1, 2):
+                # Get the voice path of the voice 1 index ahead of the operator
+                path = await self._voice_manager.get_voice_path(
+                    split_voice[operation_index + 1][0]
                 )
-                combined = torch.sum(torch.stack(voice_tensors), dim=0)
+                voice_tensor = await self._load_voice_from_path(
+                    path, split_voice[operation_index + 1][1] / total_weight
+                )
 
-                # Save combined tensor
-                temp_dir = tempfile.gettempdir()
-                combined_path = os.path.join(temp_dir, f"{voice}.pt")
-                logger.debug(f"Saving combined voice to: {combined_path}")
-                torch.save(combined, combined_path)
+                # Either add or subtract the voice from the current combined voice
+                if split_voice[operation_index] == "+":
+                    combined_tensor += voice_tensor
+                else:
+                    combined_tensor -= voice_tensor
 
-                return voice, combined_path
-            else:
-                # Single voice
-                path = await self._voice_manager.get_voice_path(voice)
-                if not path:
-                    raise RuntimeError(f"Voice not found: {voice}")
-                logger.debug(f"Using single voice path: {path}")
-                return voice, path
+            # Save the new combined voice so it can be loaded latter
+            temp_dir = tempfile.gettempdir()
+            combined_path = os.path.join(temp_dir, f"{voice}.pt")
+            logger.debug(f"Saving combined voice to: {combined_path}")
+            torch.save(combined_tensor, combined_path)
+            return voice, combined_path
         except Exception as e:
             logger.error(f"Failed to get voice path: {e}")
             raise
@@ -219,20 +255,23 @@ class TTSService:
         self,
         text: str,
         voice: str,
+        writer: StreamingAudioWriter,
         speed: float = 1.0,
         output_format: str = "wav",
         lang_code: Optional[str] = None,
-    ) -> AsyncGenerator[bytes, None]:
+        normalization_options: Optional[NormalizationOptions] = NormalizationOptions(),
+        return_timestamps: Optional[bool] = False,
+    ) -> AsyncGenerator[AudioChunk, None]:
         """Generate and stream audio chunks."""
         stream_normalizer = AudioNormalizer()
         chunk_index = 0
-
+        current_offset = 0.0
         try:
             # Get backend
             backend = self.model_manager.get_backend()
 
             # Get voice path, handling combined voices
-            voice_name, voice_path = await self._get_voice_path(voice)
+            voice_name, voice_path = await self._get_voices_path(voice)
             logger.debug(f"Using voice path: {voice_path}")
 
             # Use provided lang_code or determine from voice name
@@ -242,29 +281,42 @@ class TTSService:
             )
 
             # Process text in chunks with smart splitting
-            async for chunk_text, tokens in smart_split(text):
+            async for chunk_text, tokens in smart_split(
+                text,
+                lang_code=pipeline_lang_code,
+                normalization_options=normalization_options,
+            ):
                 try:
                     # Process audio for chunk
-                    async for result in self._process_chunk(
+                    async for chunk_data in self._process_chunk(
                         chunk_text,  # Pass text for Kokoro V1
                         tokens,  # Pass tokens for legacy backends
                         voice_name,  # Pass voice name
                         voice_path,  # Pass voice path
                         speed,
+                        writer,
                         output_format,
                         is_first=(chunk_index == 0),
                         is_last=False,  # We'll update the last chunk later
                         normalizer=stream_normalizer,
                         lang_code=pipeline_lang_code,  # Pass lang_code
+                        return_timestamps=return_timestamps,
                     ):
-                        if result is not None:
-                            yield result
-                            chunk_index += 1
+                        if chunk_data.word_timestamps is not None:
+                            for timestamp in chunk_data.word_timestamps:
+                                timestamp.start_time += current_offset
+                                timestamp.end_time += current_offset
+
+                        current_offset += len(chunk_data.audio) / 24000
+
+                        if chunk_data.output is not None:
+                            yield chunk_data
+
                         else:
                             logger.warning(
                                 f"No audio generated for chunk: '{chunk_text[:100]}...'"
                             )
-
+                        chunk_index += 1
                 except Exception as e:
                     logger.error(
                         f"Failed to process audio for chunk: '{chunk_text[:100]}...'. Error: {str(e)}"
@@ -275,284 +327,57 @@ class TTSService:
             if chunk_index > 0:
                 try:
                     # Empty tokens list to finalize audio
-                    async for result in self._process_chunk(
+                    async for chunk_data in self._process_chunk(
                         "",  # Empty text
                         [],  # Empty tokens
                         voice_name,
                         voice_path,
                         speed,
+                        writer,
                         output_format,
                         is_first=False,
                         is_last=True,  # Signal this is the last chunk
                         normalizer=stream_normalizer,
                         lang_code=pipeline_lang_code,  # Pass lang_code
                     ):
-                        if result is not None:
-                            yield result
+                        if chunk_data.output is not None:
+                            yield chunk_data
                 except Exception as e:
                     logger.error(f"Failed to finalize audio stream: {str(e)}")
 
         except Exception as e:
             logger.error(f"Error in phoneme audio generation: {str(e)}")
-            raise
+            raise e
 
     async def generate_audio(
         self,
         text: str,
         voice: str,
+        writer: StreamingAudioWriter,
         speed: float = 1.0,
         return_timestamps: bool = False,
+        normalization_options: Optional[NormalizationOptions] = NormalizationOptions(),
         lang_code: Optional[str] = None,
-    ) -> Union[Tuple[np.ndarray, float], Tuple[np.ndarray, float, List[dict]]]:
+    ) -> AudioChunk:
         """Generate complete audio for text using streaming internally."""
-        start_time = time.time()
-        chunks = []
-        word_timestamps = []
+        audio_data_chunks = []
 
         try:
-            # Get backend and voice path
-            backend = self.model_manager.get_backend()
-            voice_name, voice_path = await self._get_voice_path(voice)
+            async for audio_stream_data in self.generate_audio_stream(
+                text,
+                voice,
+                writer,
+                speed=speed,
+                normalization_options=normalization_options,
+                return_timestamps=return_timestamps,
+                lang_code=lang_code,
+                output_format=None,
+            ):
+                if len(audio_stream_data.audio) > 0:
+                    audio_data_chunks.append(audio_stream_data)
 
-            if isinstance(backend, KokoroV1):
-                # Use provided lang_code or determine from voice name
-                pipeline_lang_code = lang_code if lang_code else voice[:1].lower()
-                logger.info(
-                    f"Using lang_code '{pipeline_lang_code}' for voice '{voice_name}' in text chunking"
-                )
-
-                # Get pipelines from backend for proper device management
-                try:
-                    # Initialize quiet pipeline for text chunking
-                    text_chunks = []
-                    current_offset = 0.0  # Track time offset for timestamps
-
-                    logger.debug("Splitting text into chunks...")
-                    # Use backend's pipeline management
-                    for result in backend._get_pipeline(pipeline_lang_code)(text):
-                        if result.graphemes and result.phonemes:
-                            text_chunks.append((result.graphemes, result.phonemes))
-                    logger.debug(f"Split text into {len(text_chunks)} chunks")
-
-                    # Process each chunk
-                    for chunk_idx, (chunk_text, chunk_phonemes) in enumerate(
-                        text_chunks
-                    ):
-                        logger.debug(
-                            f"Processing chunk {chunk_idx + 1}/{len(text_chunks)}: '{chunk_text[:50]}...'"
-                        )
-
-                        # Use backend's pipeline for generation
-                        for result in backend._get_pipeline(pipeline_lang_code)(
-                            chunk_text, voice=voice_path, speed=speed
-                        ):
-                            # Collect audio chunks
-                            if result.audio is not None:
-                                chunks.append(result.audio.numpy())
-
-                            # Process timestamps for this chunk
-                            if (
-                                return_timestamps
-                                and hasattr(result, "tokens")
-                                and result.tokens
-                            ):
-                                logger.debug(
-                                    f"Processing chunk timestamps with {len(result.tokens)} tokens"
-                                )
-                                if result.pred_dur is not None:
-                                    try:
-                                        # Join timestamps for this chunk's tokens
-                                        KPipeline.join_timestamps(
-                                            result.tokens, result.pred_dur
-                                        )
-
-                                        # Add timestamps with offset
-                                        for token in result.tokens:
-                                            if not all(
-                                                hasattr(token, attr)
-                                                for attr in [
-                                                    "text",
-                                                    "start_ts",
-                                                    "end_ts",
-                                                ]
-                                            ):
-                                                continue
-                                            if not token.text or not token.text.strip():
-                                                continue
-
-                                            # Apply offset to timestamps
-                                            start_time = (
-                                                float(token.start_ts) + current_offset
-                                            )
-                                            end_time = (
-                                                float(token.end_ts) + current_offset
-                                            )
-
-                                            word_timestamps.append(
-                                                {
-                                                    "word": str(token.text).strip(),
-                                                    "start_time": start_time,
-                                                    "end_time": end_time,
-                                                }
-                                            )
-                                            logger.debug(
-                                                f"Added timestamp for word '{token.text}': {start_time:.3f}s - {end_time:.3f}s"
-                                            )
-
-                                        # Update offset for next chunk based on pred_dur
-                                        chunk_duration = (
-                                            float(result.pred_dur.sum()) / 80
-                                        )  # Convert frames to seconds
-                                        current_offset = max(
-                                            current_offset + chunk_duration, end_time
-                                        )
-                                        logger.debug(
-                                            f"Updated time offset to {current_offset:.3f}s"
-                                        )
-
-                                    except Exception as e:
-                                        logger.error(
-                                            f"Failed to process timestamps for chunk: {e}"
-                                        )
-                                logger.debug(
-                                    f"Processing timestamps with pred_dur shape: {result.pred_dur.shape}"
-                                )
-                                try:
-                                    # Join timestamps for this chunk's tokens
-                                    KPipeline.join_timestamps(
-                                        result.tokens, result.pred_dur
-                                    )
-                                    logger.debug(
-                                        "Successfully joined timestamps for chunk"
-                                    )
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to join timestamps for chunk: {e}"
-                                    )
-                                    continue
-
-                            # Convert tokens to timestamps
-                            for token in result.tokens:
-                                try:
-                                    # Skip tokens without required attributes
-                                    if not all(
-                                        hasattr(token, attr)
-                                        for attr in ["text", "start_ts", "end_ts"]
-                                    ):
-                                        logger.debug(
-                                            f"Skipping token missing attributes: {dir(token)}"
-                                        )
-                                        continue
-
-                                    # Get and validate text
-                                    text = (
-                                        str(token.text).strip()
-                                        if token.text is not None
-                                        else ""
-                                    )
-                                    if not text:
-                                        logger.debug("Skipping empty token")
-                                        continue
-
-                                    # Get and validate timestamps
-                                    start_ts = getattr(token, "start_ts", None)
-                                    end_ts = getattr(token, "end_ts", None)
-                                    if start_ts is None or end_ts is None:
-                                        logger.debug(
-                                            f"Skipping token with None timestamps: {text}"
-                                        )
-                                        continue
-
-                                    # Convert timestamps to float
-                                    try:
-                                        start_time = float(start_ts)
-                                        end_time = float(end_ts)
-                                    except (TypeError, ValueError):
-                                        logger.debug(
-                                            f"Skipping token with invalid timestamps: {text}"
-                                        )
-                                        continue
-
-                                    # Add timestamp
-                                    word_timestamps.append(
-                                        {
-                                            "word": text,
-                                            "start_time": start_time,
-                                            "end_time": end_time,
-                                        }
-                                    )
-                                    logger.debug(
-                                        f"Added timestamp for word '{text}': {start_time:.3f}s - {end_time:.3f}s"
-                                    )
-                                except Exception as e:
-                                    logger.warning(f"Error processing token: {e}")
-                                    continue
-
-                except Exception as e:
-                    logger.error(f"Failed to process text with pipeline: {e}")
-                    raise RuntimeError(f"Pipeline processing failed: {e}")
-
-                if not chunks:
-                    raise ValueError("No audio chunks were generated successfully")
-
-                # Combine chunks
-                audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
-                processing_time = time.time() - start_time
-
-                if return_timestamps:
-                    # Validate timestamps before returning
-                    if not word_timestamps:
-                        logger.warning("No valid timestamps were generated")
-                    else:
-                        # Sort timestamps by start time to ensure proper order
-                        word_timestamps.sort(key=lambda x: x["start_time"])
-                        # Validate timestamp sequence
-                        for i in range(1, len(word_timestamps)):
-                            prev = word_timestamps[i - 1]
-                            curr = word_timestamps[i]
-                            if curr["start_time"] < prev["end_time"]:
-                                logger.warning(
-                                    f"Overlapping timestamps detected: '{prev['word']}' ({prev['start_time']:.3f}-{prev['end_time']:.3f}) and '{curr['word']}' ({curr['start_time']:.3f}-{curr['end_time']:.3f})"
-                                )
-
-                        logger.debug(
-                            f"Returning {len(word_timestamps)} word timestamps"
-                        )
-                        logger.debug(
-                            f"First timestamp: {word_timestamps[0]['word']} at {word_timestamps[0]['start_time']:.3f}s"
-                        )
-                        logger.debug(
-                            f"Last timestamp: {word_timestamps[-1]['word']} at {word_timestamps[-1]['end_time']:.3f}s"
-                        )
-
-                    return audio, processing_time, word_timestamps
-                return audio, processing_time
-
-            else:
-                # For legacy backends
-                async for chunk in self.generate_audio_stream(
-                    text,
-                    voice,
-                    speed,  # Default to WAV for raw audio
-                ):
-                    if chunk is not None:
-                        chunks.append(chunk)
-
-                if not chunks:
-                    raise ValueError("No audio chunks were generated successfully")
-
-                # Combine chunks
-                audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
-                processing_time = time.time() - start_time
-
-                if return_timestamps:
-                    return (
-                        audio,
-                        processing_time,
-                        [],
-                    )  # Empty timestamps for legacy backends
-                return audio, processing_time
-
+            combined_audio_data = AudioChunk.combine(audio_data_chunks)
+            return combined_audio_data
         except Exception as e:
             logger.error(f"Error in audio generation: {str(e)}")
             raise
@@ -563,6 +388,7 @@ class TTSService:
         Returns:
             Combined voice tensor
         """
+
         return await self._voice_manager.combine_voices(voices)
 
     async def list_voices(self) -> List[str]:
@@ -591,7 +417,7 @@ class TTSService:
         try:
             # Get backend and voice path
             backend = self.model_manager.get_backend()
-            voice_name, voice_path = await self._get_voice_path(voice)
+            voice_name, voice_path = await self._get_voices_path(voice)
 
             if isinstance(backend, KokoroV1):
                 # For Kokoro V1, use generate_from_tokens with raw phonemes

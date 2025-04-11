@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kokoro-fastapi.fullname" . }}-kokoro-tts-service
+  labels:
+    {{- include "kokoro-fastapi.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.kokoroTTS.port }}
+      targetPort: kokoro-tts-http
+      protocol: TCP
+      name: kokoro-tts-http
+  selector:
+    {{- include "kokoro-fastapi.selectorLabels" . | nindent 4 }}

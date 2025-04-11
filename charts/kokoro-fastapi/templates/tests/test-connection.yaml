@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "kokoro-fastapi.fullname" . }}-test-connection"
+  labels:
+    {{- include "kokoro-fastapi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  containers:
+    - name: wget
+      image: busybox
+      command: ['wget']
+      args: ['{{ include "kokoro-fastapi.fullname" . }}:{{ .Values.kokoroTTS.port }}']
+  restartPolicy: Never
