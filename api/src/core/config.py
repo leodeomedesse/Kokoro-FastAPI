@@ -3,8 +3,8 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # API Settings
-    api_title: str = "Kokoro TTS API"
-    api_description: str = "API for text-to-speech generation using Kokoro"
+    api_title: str = "VoicceLabs TTS API"
+    api_description: str = "API for text-to-speech generation using VoicceLabs"
     api_version: str = "1.0.0"
     host: str = "0.0.0.0"
     port: int = 8880
